@@ -1,2 +1,2 @@
-from .lightseq_async_attn import _lightseq_forward, _lightseq_backward
+from .attn import _attn_forward, _attn_backward
 from .async_communication import initialize_distributed, reset_global_memory_buffer, get_sequence_parallel_group

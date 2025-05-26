@@ -25,8 +25,8 @@ try:
 except:
     pass
 
-from .async_communication import (is_last_time, is_compute_for_local_query, is_sync_from_remote, is_idle, print_and_reset_comm_stats, 
-        launch_async_handles, wait_async_handles, maybe_send_recv_fwd_qkvo, maybe_send_recv_bwd_qkvo, maybe_send_recv_bwd_last_dkv, reset_global_memory_buffer,
+from .async_communication import (
+        wait_async_handles,  reset_global_memory_buffer,
         maybe_get_set_global_memory_buffer, maybe_get_set_global_memory_buffer_bwd, initialize_distributed, get_sequence_parallel_size, get_sequence_parallel_rank,
         send_recv_fwd_q, send_recv_fwd_Lo, send_recv_bwd_comp_reqs, send_recv_bwd_rescale_reqs)
 
@@ -294,12 +294,9 @@ def maybe_reduce_dkv(nkvh, dkv):
     return torch.sum(dkv_reshape, dim=3)
 
 
-def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None, 
+def _attn_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None, 
                     local_bias_args=[], remote_bias_args=[], no_overlap=False):
     # bias_args is a tuple or list of arguments to the bias_func
-
-    # maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    # q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     # shape constraints
     Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -314,9 +311,6 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
     # assert Lk in {16, 32, 64, 128}
     BLOCK_M = 32
     BLOCK_N = 32
-    # print q, k, v shaper
-    # print(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
-    # print(f"Lq: {Lq}, Lk: {Lk}, Lv: {Lv}")
    
     bsz, nh, seq_len, hdim = q.shape
 
@@ -360,7 +354,6 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
                 num_stages=4)
     
     peer_q[0] = q.clone().detach() # need to clone to avoid overwrite q
-    # peer_m[0] = m
     peer_L[0] = L
     peer_o[0] = o
     for i in range(len(remote_bias_args)):
@@ -369,9 +362,6 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
     mlo_reqs = []
     torch.cuda.synchronize()
     for time_step in range(seq_world_size):
-        # This is important for cuda scheduler to execute nccl calls first.
-        # torch.cuda.synchronize()
-        # Communication uses buffer_idx_1, and compute uses buffer_idx_2, which effectively are contents from the last time step.
         send_buffer_idx = time_step % 2
         recv_buffer_idx = (time_step - 1) % 2
 
@@ -394,7 +384,6 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
         o_delta = torch.zeros_like(o)
         L_delta = torch.zeros_like(L)
         bias = None
-        # print(f"time_step: {time_step}")
         if bias_func is not None:
             bias = bias_func(*(local_bias_args + peer_bias_args[send_buffer_idx])) # [B, 1, L_Q, L_KV]
             bias = bias.expand(bsz, nh, Lq, Lk) # [B, H, L_Q, L_KV]
@@ -445,12 +434,11 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
 
     return q, k, v, o, L
 
-def _lightseq_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_engine, bias_func=None, local_bias_args=[], remote_bias_args=[], no_overlap=False):
+def _attn_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_engine, bias_func=None, local_bias_args=[], remote_bias_args=[], no_overlap=False):
     bsz, nh, seq_len, hdim = q.shape
     Lq, Lk, Lv = q.shape[-2], k.shape[-2], v.shape[-2]
 
     q, k, v, o, do = [rearrange(_x, 'b h s d -> b s h d').contiguous() for _x in [q, k, v, o, do]]
-    # print(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}, o shape: {o.shape}, do shape: {do.shape}")
     L = rearrange(L, '(b h) s -> b h s', b=q.shape[0])
 
     # pad L to have length (s) divisible by 128

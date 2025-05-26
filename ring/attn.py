@@ -24,8 +24,7 @@ try:
 except:
     pass
 
-from .async_communication import (is_last_time, is_compute_for_local_query, is_sync_from_remote, is_idle, print_and_reset_comm_stats, 
-        launch_async_handles, wait_async_handles, maybe_send_recv_fwd_qkvo, maybe_send_recv_bwd_kv, maybe_send_recv_bwd_delta, reset_global_memory_buffer,
+from .async_communication import (wait_async_handles, maybe_send_recv_fwd_qkvo, maybe_send_recv_bwd_kv, maybe_send_recv_bwd_delta, reset_global_memory_buffer,
         maybe_get_set_global_memory_buffer, maybe_get_set_global_memory_buffer_bwd, initialize_distributed, get_sequence_parallel_size, get_sequence_parallel_rank)
 
 @triton.jit
@@ -184,17 +183,12 @@ def maybe_reduce_dkv(nkvh, dkv):
     return torch.sum(dkv_reshape, dim=3)
 
 
-def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None, 
+def _attn_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None, 
                     local_bias_args=[], remote_bias_args=[], no_overlap=False):
     # bias_args is a tuple or list of arguments to the bias_func
 
-    # maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
-    # q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-
-    # shape constraints
     Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
     Lq, Lk, Lv = q.shape[-2], k.shape[-2], v.shape[-2]
-    # Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Dq == Dk == Dv
     assert Lk == Lv
     # assert Lk in {16, 32, 64, 128}
@@ -214,8 +208,6 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
     
     grid = (triton.cdiv(seq_len, BLOCK_M), bsz * nh, 1)
     num_warps = 4 if Lk <= 64 else 8
-    # num_warps = 4
-    # print(f"num_warps: {num_warps}")
     
     seq_rank = get_sequence_parallel_rank()
     seq_world_size = get_sequence_parallel_size()
@@ -293,12 +285,11 @@ def _lightseq_forward(q, k, v, causal, sm_scale, comm_mode, bias_func=None,
     torch.cuda.synchronize()
     return q, k, v, o, L
 
-def _lightseq_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_engine, bias_func=None, local_bias_args=[], remote_bias_args=[], no_overlap=False):
+def _attn_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_engine, bias_func=None, local_bias_args=[], remote_bias_args=[], no_overlap=False):
     bsz, nh, seq_len, hdim = q.shape
     Lq, Lk, Lv = q.shape[-2], k.shape[-2], v.shape[-2]
 
     q, k, v, o, do = [rearrange(_x, 'b h s d -> b s h d').contiguous() for _x in [q, k, v, o, do]]
-    # print(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}, o shape: {o.shape}, do shape: {do.shape}")
     L = rearrange(L, '(b h) s -> b h s', b=q.shape[0])
     
     dq = torch.zeros_like(q)
@@ -353,24 +344,6 @@ def _lightseq_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_
         dq_delta_cur = torch.empty_like(dq)
         dk_delta_cur = torch.empty_like(dk)
         dv_delta_cur = torch.empty_like(dv)
-        # print(f"calc using peer_k[send_buffer_idx]: {peer_k[send_buffer_idx]}")
-        # _flash_attn_backward(
-        #     do, 
-        #     q, 
-        #     peer_k[send_buffer_idx], 
-        #     peer_v[send_buffer_idx], 
-        #     o, 
-        #     L, 
-        #     dq_delta_cur,
-        #     dk_delta_cur,
-        #     dv_delta_cur,
-        #     0.0, 
-        #     sm_scale, 
-        #     False, 
-        #     (-1, -1), 
-        #     None, 
-        #     False, 
-        #     None)
         bias = None
         if bias_func is not None:
             bias = bias_func(*(local_bias_args + peer_bias_args[send_buffer_idx])) # [B, 1, L_Q, L_KV]
@@ -395,7 +368,6 @@ def _lightseq_backward(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_
         wait_async_handles(rescale_reqs)
         dk_delta[send_buffer_idx] += dk_delta_cur
         dv_delta[send_buffer_idx] += dv_delta_cur
-        # print(f"updating dk_delta[send_buffer_idx]: {dk_delta[send_buffer_idx]}")
 
         rescale_reqs = maybe_send_recv_bwd_delta(
             dk_delta_send=dk_delta[send_buffer_idx],

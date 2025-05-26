@@ -10,13 +10,13 @@ import csv
 import os
 
 from torch.profiler import profile, record_function, ProfilerActivity
-from lv_xattn import _lightseq_forward as _lv_xattn_forward, \
-                            _lightseq_backward as _lv_xattn_backward, \
+from lv_xattn import _attn_forward as _lv_xattn_forward, \
+                            _attn_backward as _lv_xattn_backward, \
                             initialize_distributed as _lv_xattn_initialize_distributed, \
                             reset_global_memory_buffer as _lv_xattn_reset_global_memory_buffer
 
-from ring import _lightseq_forward as _ring_forward, \
-                            _lightseq_backward as _ring_backward, \
+from ring import _attn_forward as _ring_forward, \
+                            _attn_backward as _ring_backward, \
                             initialize_distributed as _ring_initialize_distributed, \
                             reset_global_memory_buffer as _ring_reset_global_memory_buffer
 
@@ -40,7 +40,7 @@ def create_attention_class(attention_mode):
     class _attention(torch.autograd.Function):
         @staticmethod
         def forward(ctx, q, k, v, causal, sm_scale, bias_func=None, local_bias_args=[], remote_bias_args=[]):
-            comm_mode = 'lightseq'
+            comm_mode = None
             backward_engine = 'flash'
 
             if attention_mode == 'lv_xattn':
@@ -237,7 +237,7 @@ def benchmark(attention_mode, Z, H, L_Q, L_KV, D_HEAD, causal, dtype=torch.float
 
 if __name__ == "__main__":
     Z = 1
-    H = 8
+    H = 16
     D_HEAD = 128
     causal=False
     total_iter = 15
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     atol = 1e-2
     rtol = 1e-3
     assert_close = True
-    add_bias = False
+    add_bias = True
     trace_dir = "trace/"
     result_csv = "benchmark_results.csv"
 
@@ -280,10 +280,10 @@ if __name__ == "__main__":
                         bias[:, :, :, 1::2] = val
                         return bias
                         # return torch.ones(list(shape), device="cuda")
-                    if attention_mode in ['lv_xattn', 'ring', 'lv_xattn_gather', 'ring_gather', 'lv_xattn_optimized', 'ring_optimized']:
+                    if attention_mode in ['lv_xattn', 'ring']:
                         local_bias_args = [torch.tensor([Z, H, L_Q // dist.get_world_size(), L_KV // dist.get_world_size()], device="cuda")]
                         remote_bias_args = [torch.tensor(1, device="cuda")]
-                    elif attention_mode in ['dupq']:
+                    else:
                         local_bias_args = [torch.tensor([Z, H, L_Q, L_KV // dist.get_world_size()], device="cuda")]
                         remote_bias_args = [torch.tensor(1, device="cuda")]
 

@@ -40,19 +40,18 @@ from transformers.models.mllama.modeling_mllama import (
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
 
 ### lv-xattn
-from lv_xattn import _lightseq_forward as _lv_xattn_forward, \
-                            _lightseq_backward as _lv_xattn_backward, \
+from lv_xattn import _attn_forward as _lv_xattn_forward, \
+                            _attn_backward as _lv_xattn_backward, \
                             initialize_distributed as _lv_xattn_initialize_distributed, \
-                            reset_global_memory_buffer as _lv_xattn_reset_global_memory_buffer, \
-                            prepare_dist_flash_attn_inputs \
+                            reset_global_memory_buffer as _lv_xattn_reset_global_memory_buffer
 
-from ring import _lightseq_forward as _ring_forward, \
-                            _lightseq_backward as _ring_backward, \
+from ring import _attn_forward as _ring_forward, \
+                            _attn_backward as _ring_backward, \
                             initialize_distributed as _ring_initialize_distributed, \
                             reset_global_memory_buffer as _ring_reset_global_memory_buffer
 
-from ring_self import _lightseq_forward as _ring_self_forward, \
-                            _lightseq_backward as _ring_self_backward, \
+from ring_self import _attn_forward as _ring_self_forward, \
+                            _attn_backward as _ring_self_backward, \
                             initialize_distributed as _ring_self_initialize_distributed, \
                             reset_global_memory_buffer as _ring_self_reset_global_memory_buffer
 
@@ -130,7 +129,7 @@ def create_attention_class_save_qkv(attention_mode, no_overlap=False):
         def forward(ctx, q, k, v, causal, sm_scale, bias_func=None, local_bias_args=[], remote_bias_args=[]):
             torch.cuda.synchronize()
             start_time = time.time()
-            comm_mode = 'lightseq'
+            comm_mode = None
             backward_engine = 'flash'
             
             if attention_mode == 'lv_xattn':
@@ -185,7 +184,7 @@ def create_attention_class(attention_mode, no_overlap=False):
         def forward(ctx, x, run_function, is_causal):
             torch.cuda.synchronize()
             start_time = time.time()
-            comm_mode = 'lightseq'
+            comm_mode = None
             backward_engine = 'flash'
             
             if attention_mode == 'lv_xattn':
@@ -236,13 +235,7 @@ def create_attention_class(attention_mode, no_overlap=False):
             q, k, v = run_function(x, get_global_cross_attention_states())
             sm_scale = q.size(-1) ** -0.5
 
-            # print(f"in attention class backward, rank is {dist.get_rank()}, media_length is {media_length}, media_start_position_id is {media_start_position_id}")
-            print(f"in attention class backward, rank is {dist.get_rank()}, memory allocated: {torch.cuda.memory_allocated() / 1024**3} GB")
-            
             dq, dk, dv = backward_func(do, q, k, v, o, L, causal, sm_scale, comm_mode, backward_engine, bias_func=None, no_overlap=no_overlap)
-
-            # TODO: deal with this
-            # torch.autograd.backward([q, k, v], [dq, dk, dv])
 
             reset_global_memory_buffer(attention_mode)
             torch.cuda.synchronize()
@@ -376,8 +369,6 @@ def patch_cross_attention_forward(attention_mode):
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
-        print(f"before cross attention memory usage: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
-
         def project(hidden_states, cross_attention_states):
             if output_attentions:
                 # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -395,10 +386,6 @@ def patch_cross_attention_forward(attention_mode):
                     cache_position=cache_position,
                 )
             
-            print(f"past_key_value: {past_key_value}")
-            print(f"use_cache: {use_cache}")
-            # print(f"cache_position: {cache_position}")
-
             bsz, q_len, _ = hidden_states.size()
             query_states = self.q_proj(hidden_states)
             query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -442,22 +429,10 @@ def patch_cross_attention_forward(attention_mode):
             # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
             is_causal = True if attention_mask is None and q_len > 1 else False
 
-            # print (query_states.size(), key_states.size(), value_states.size(), attention_mask.size())
-            print("query_states", query_states.size())
-            print("key_states", key_states.size())
-            print("value_states", value_states.size())
-            print("attention_mask", attention_mask.size())
-            print(f"dropout: {self.dropout}") # 0 
-            print(f"is_causal: {is_causal}", flush=True) # false
-
             # see if requires grad
             query_states.requires_grad_()
             key_states.requires_grad_()
             value_states.requires_grad_()
-
-            print(f"query_states requires grad: {query_states.requires_grad}")
-            print(f"key_states requires grad: {key_states.requires_grad}")
-            print(f"value_states requires grad: {value_states.requires_grad}")
 
             return query_states, key_states, value_states
         
@@ -488,8 +463,6 @@ def patch_cross_attention_forward(attention_mode):
         attn_output = self.o_proj(attn_output)
 
         # print memory usage
-        print(f"after cross attention memory usage: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
-
         return attn_output, None, past_key_value
     
     return forward
@@ -605,7 +578,6 @@ def get_hf_token():
 
 def load_model_and_processor(model_name: str):
     """Load model and processor with optional LoRA adapter"""
-    print(f"Loading model: {model_name}")
     hf_token = get_hf_token()
     model = MllamaForConditionalGeneration.from_pretrained(
         model_name,
@@ -616,14 +588,12 @@ def load_model_and_processor(model_name: str):
         device_map=device,
         token=hf_token,
     )
-    print(f"Model loaded: {model_name}")
     # print(model.language_model.model.layers)
     processor = MllamaProcessor.from_pretrained(
         model_name, 
         cache_dir="/tmp/",
         token=hf_token, use_safetensors=True
     )
-    print(f"Processor loaded: {model_name}")
 
     # model, processor = accelerator.prepare(model, processor)
     return model, processor
@@ -671,7 +641,6 @@ def fsdp(model):
                 ],
             )
     
-    print(f"before fsdp num params: {sum(p.numel() for p in model.parameters())}")
     with enable_wrap(wrapper_cls=FSDP):
         model.language_model.model.layers = nn.ModuleList(
             wrap(layer) for layer in model.language_model.model.layers
@@ -682,7 +651,6 @@ def fsdp(model):
         auto_wrap_policy=my_auto_wrapping_policy,
         use_orig_params=False,
     )
-    print(f"after fsdp num params: {sum(p.numel() for p in model.parameters())}")
     
     return model
 
@@ -706,20 +674,12 @@ def benchmark(args, attention_mode, per_sample_num_images, per_sample_text_lengt
     np.random.seed(0)
 
     model, processor = load_model_and_processor(args.model_name)
-    print(f"model and processor loaded", flush=True)
     # apply_liger_kernel_to_mllama(model)
     freeze_Vision_only(model)
-    print(f"vision model frozen", flush=True)
 
     model = fsdp(model)
-    print(model)
 
     model.train()
-
-    # print number of parameters that require grad
-    print(f"num params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    # print param name if it doesn't require grad
-    # 3/0
 
     time_lapses = {
         "forward": [],
@@ -733,7 +693,6 @@ def benchmark(args, attention_mode, per_sample_num_images, per_sample_text_lengt
         prompt = "<|image|>" * local_num_images
         # padd prompt to local_text_length
         prompt = prompt + " a" * (local_text_length - local_num_images)
-        print(prompt)
 
         inputs = processor(
             image, prompt, text_kwargs={"add_special_tokens": False}, return_tensors="pt"
@@ -757,11 +716,7 @@ def benchmark(args, attention_mode, per_sample_num_images, per_sample_text_lengt
         time_lapses["ca_forward"].append(sum(get_ca_time_lapses()))
         time_lapses["vision_encoder_forward"].append(sum(get_vision_encoder_time_lapses()))
 
-        # loss = torch.tensor(0.0)
-        # print output
-        print(f"outputs: {outputs}")
         loss = outputs.loss
-        print(f"loss: {loss}")
 
         reset_global_memory_buffer(attention_mode)
         torch.cuda.empty_cache()
@@ -824,44 +779,20 @@ def append_row(file, attention_mode, num_nodes, text_length, num_images, round, 
 def main(args):
     attention_modes = ['lv_xattn', 'ring']
     num_nodes = int(os.environ['WORLD_SIZE'])
-    print(f"num_nodes: {num_nodes}")
     per_sample_text_length_num_images = [
-        (127 * num_nodes, 24 * num_nodes),
-        (127 * num_nodes, 12 * num_nodes),
-        # (63 * num_nodes, 12 * num_nodes),
-        # (31 * num_nodes, 12 * num_nodes),
-        # (64 * num_nodes, 20 * num_nodes),
-        # (63 * num_nodes, 20 * num_nodes),
-        # (31 * num_nodes, 5 * num_nodes),
-        # (63 * num_nodes, 4 * num_nodes),
-        # (63 * num_nodes, 2 * num_nodes),
-        # (31 * num_nodes, 4 * num_nodes),
-        # (31 * num_nodes, 2 * num_nodes),
-        # (63 * num_nodes, 10 * num_nodes),
-
-        # (31 * num_nodes, 20 * num_nodes),
-        # (31 * num_nodes, 10 * num_nodes),
-        # (10 * num_nodes, 10 * num_nodes),
-        # (20 * num_nodes, 10 * num_nodes),
-        # (40 * num_nodes, 20 * num_nodes),
-        # (20 * num_nodes, 20 * num_nodes),
-        # (20 * num_nodes, 10 * num_nodes),
+        (63 * num_nodes, 12 * num_nodes),
     ]
-    # assert text length does not exceed 2048
-    # for text_length, num_images in per_sample_text_length_num_images:
-    #     assert text_length <= 2048
-    actual_iter = 3
+    actual_iter = 5
     warmup_iter = 2
     total_iter = actual_iter + warmup_iter
     is_profile=False
     benchmark_file = f"llama_experiments/llama_benchmark_{num_nodes}.csv"
+    os.makedirs(os.path.dirname(benchmark_file), exist_ok=True)
     trace_dir = "llama_trace"
-    # mkdir if not exists
     if is_profile and not os.path.exists(trace_dir):
         os.makedirs(trace_dir)
 
     header_added = False
-
     for text_length, num_images in per_sample_text_length_num_images:
         for attention_mode in attention_modes:
             initialize_distributed(attention_mode)

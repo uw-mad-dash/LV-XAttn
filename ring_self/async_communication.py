@@ -36,11 +36,6 @@ _DV_DELTA_FROM_PEER = None
 _PEER_DO = None
 
 
-_fwd_send_volume = 0
-_fwd_recv_volume = 0
-_bwd_send_volume = 0
-_bwd_recv_volume = 0
-
 def initialize_distributed():
     if dist.is_initialized():
         if dist.get_rank() == 0:
@@ -95,25 +90,16 @@ def _initialize_sequence_parallel(sequence_parallel_size=None):
             _SEQUENCE_PARALLEL_SIZE = len(ranks)
 
     if dist.get_rank() == 0:
-        print("************ Finish sequence pralell group Initialization. ***********")
+        print("************ Finish sequence parallel group Initialization. ***********")
     # _set_global_memory_buffer()
 
 def maybe_get_set_global_memory_buffer(q, k, v, m, l, o, bias_args):
     global _PEER_Q, _PEER_K, _PEER_V, _PEER_M, _PEER_L, _PEER_O, _PEER_BIAS_ARGS
     # if _PEER_Q is None:
     if _PEER_Q is None or q.shape != _PEER_Q[0].shape or k.shape != _PEER_K[0].shape:
-        # try:
-        #     if get_sequence_parallel_rank() == 0:
-        #         print("Initializing global memoery buffer.")
-        # except:
-        #     print("Initializing global memoery buffer.")
-        # _PEER_Q = [torch.empty_like(q) for _ in range(2)]
         _PEER_Q = None
         _PEER_K = [torch.empty_like(k) for _ in range(2)]
         _PEER_V = [torch.empty_like(v) for _ in range(2)]
-        # _PEER_M = [torch.empty_like(m) for _ in range(2)]
-        # _PEER_L = [torch.empty_like(l) for _ in range(2)]
-        # _PEER_O = [torch.empty_like(o) for _ in range(2)]
         _PEER_M = None
         _PEER_L = None
         _PEER_O = None
@@ -127,11 +113,6 @@ def maybe_get_set_global_memory_buffer_bwd(dq, dk, dv, q, L, k, v, o, do, bias_a
     global _DELTA_DQ, _DELTA_DK, _DELTA_DV, _DK_DELTA_FROM_PEER, _DV_DELTA_FROM_PEER,_PEER_Q_BWD, _PEER_L, _PEER_K_BWD, _PEER_V_BWD, _PEER_O_BWD, _PEER_DO, _PEER_BIAS_ARGS_BWD
     # if _DELTA_DQ is None:
     if _DELTA_DK is None or k.shape != _PEER_K_BWD[0].shape:
-        # try:
-        #     if get_sequence_parallel_rank() == 0:
-        #         print("Initializing global memoery buffer for backward.")
-        # except:
-        #     print("Initializing global memoery buffer for backward.")
         _DELTA_DQ = None 
         _DELTA_DK = [torch.empty_like(dk) for _ in range(2)]
         _DELTA_DV = [torch.empty_like(dv) for _ in range(2)]
@@ -227,59 +208,6 @@ def destroy_sequence_parallel():
     global _SEQUENCE_PARALLEL_GROUP
     _SEQUENCE_PARALLEL_GROUP = None
 
-# whether this is the last time the kernel being called
-def is_last_time(time_step):
-    # e.g. on a 8-GPU setup:
-    # R=0: 0 
-    # R=1: 1
-    # R=2: 2
-    # R=3: 3
-    # R=4: 4, 5, 6, 7
-    return time_step == get_sequence_parallel_size() - 1
-    seq_rank = get_sequence_parallel_rank()
-    seq_world_size = get_sequence_parallel_size()
-    if seq_rank <= seq_world_size // 2: # no one helps these ranks
-        rank_finish_time = seq_rank
-    else:
-        rank_finish_time = seq_world_size // 2
-    return rank_finish_time == time_step
-
-# Whether the current time step is computing for local q
-def is_compute_for_local_query(time_step):
-    # R=3,4,5,6,7: Yes
-    # R=0: 0
-    # R=1: 0, 1
-    # R=2: 0, 1, 2
-    seq_rank = get_sequence_parallel_rank()
-    seq_world_size = get_sequence_parallel_size()
-    if seq_rank >= min(seq_world_size // 2, time_step):
-        return True
-    return False
-
-# Whether the current time step is idle
-def is_idle(time_step):
-    # 0, 1, 2, 3: 4
-    # 4, 5, 6, 7: No
-    seq_rank = get_sequence_parallel_rank()
-    seq_world_size = get_sequence_parallel_size()
-
-    # if seq_rank < (seq_world_size // 2) and time_step == seq_world_size // 2:
-    #     return True
-    return False
-
-# Whether the current time step needs to synchronize with a remote computed result
-def is_sync_from_remote(time_step):
-    return False
-    # R=0, 1, 2, 3, 4: No
-    # R=5: 4
-    # R=6: 3, 4
-    # R=7: 2, 3, 4
-    seq_rank = get_sequence_parallel_rank()
-    seq_world_size = get_sequence_parallel_size()
-    if seq_rank > max(seq_world_size // 2, seq_world_size - time_step):
-        return True
-    return False
-
 def maybe_send_recv_fwd_qkvo(q_send: torch.Tensor, q_recv: torch.Tensor,
                              k_send: torch.Tensor, k_recv: torch.Tensor,
                              v_send: torch.Tensor, v_recv: torch.Tensor,
@@ -347,12 +275,8 @@ def maybe_send_recv_bwd_delta(dk_delta_send: torch.Tensor, dk_delta_recv: torch.
     
     all_handles = []
 
-    if debug:
-        global _fwd_send_volume, _fwd_recv_volume, _bwd_send_volume, _bwd_recv_volume
-    
     send_rank = (seq_rank + 1) % seq_world_size
     recv_rank = (seq_rank - 1) % seq_world_size
-    # print(f"t={time_step}: R={seq_rank} sends dkv to {send_rank}, receives from {recv_rank}")
 
     all_handles.append(P2POp(op=isend, tensor=dk_delta_send, peer=send_rank, group=seq_group))
     all_handles.append(P2POp(op=isend, tensor=dv_delta_send, peer=send_rank, group=seq_group))
@@ -360,7 +284,6 @@ def maybe_send_recv_bwd_delta(dk_delta_send: torch.Tensor, dk_delta_recv: torch.
         _bwd_send_volume += torch.numel(dk_delta_send) * dk_delta_send.element_size()
         _bwd_send_volume += torch.numel(dv_delta_send) * dv_delta_send.element_size()
 
-    # print(f"BWD t={time_step}: R={seq_rank} last receive dkv from {recv_rank}")
     all_handles.append(P2POp(op=irecv, tensor=dk_delta_recv, peer=recv_rank, group=seq_group))
     all_handles.append(P2POp(op=irecv, tensor=dv_delta_recv, peer=recv_rank, group=seq_group))
     if debug:
@@ -370,21 +293,6 @@ def maybe_send_recv_bwd_delta(dk_delta_send: torch.Tensor, dk_delta_recv: torch.
     all_reqs = launch_async_handles(all_handles, comm_mode)
      
     return [all_reqs]
-
-def print_and_reset_comm_stats():
-    seq_rank = get_sequence_parallel_rank()
-
-    global _fwd_send_volume, _fwd_recv_volume, _bwd_send_volume, _bwd_recv_volume
-    _fwd_send_volume *= 1e-9
-    _fwd_recv_volume *= 1e-9
-    _bwd_send_volume *= 1e-9
-    _bwd_recv_volume *= 1e-9
-
-    print(f"R={seq_rank} fwd send: {_fwd_send_volume} fwd recv: {_fwd_recv_volume}; bwd send: {_bwd_send_volume}, bwd recv: {_bwd_recv_volume} GB.")
-    _fwd_send_volume = 0
-    _fwd_recv_volume = 0
-    _bwd_send_volume = 0
-    _bwd_recv_volume = 0
 
 def launch_async_handles(handles, comm_mode):
     global _args
